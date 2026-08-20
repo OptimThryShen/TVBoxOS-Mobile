@@ -19,14 +19,11 @@ buildscript {
 allprojects {
     repositories {
         gradlePluginPortal()
-        //dlna-cast中cling仓
-        maven {
-            url 'http://4thline.org/m2'
-            allowInsecureProtocol true
-        }
-        maven { url "https://jitpack.io" }
         google()
         mavenCentral()
+        maven { url "https://jitpack.io" }
+        // jcenter 时代的老库(loadsir / okgo / tv-recyclerview 等)只在阿里云的 jcenter 代理里
+        maven { url "https://maven.aliyun.com/repository/public" }
     }
 }
 
