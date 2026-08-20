@@ -416,7 +416,7 @@ jobs:
           keytool -list -keystore TVBoxOSC.jks -storepass TVBoxOSC | head -5
           # 原工程写的是 Windows 路径 file('..\TVBoxOSC.jks')，Linux 上找不到，改成仓库根目录
           sed -i "s|storeFile file(.*)|storeFile rootProject.file('TVBoxOSC.jks')|" app/build.gradle
-                - name: 停用已失效的投屏依赖
+      - name: 停用已失效的投屏依赖
         run: |
           # 上游 DLNA 投屏库 (dlna-dmc / cling) 已从 JitPack 和 4thline 下架，无法解析。
           # 这里停用投屏功能，但保留 CastListDialog / CastVideo 的类型签名，
@@ -489,8 +489,6 @@ jobs:
           echo "投屏功能已停用，剩余引用："
           grep -rn "com.android.cast" --include=*.java --include=*.xml app/src/main || echo "无"
 
-grep -n "storeFile" app/build.gradle
-          printf '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\n' >> gradle.properties
       - name: 编译 Release APK
         run: |
           chmod +x gradlew
