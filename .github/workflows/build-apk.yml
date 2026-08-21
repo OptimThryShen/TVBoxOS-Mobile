@@ -730,6 +730,21 @@ jobs:
           echo "剩余失效库引用："
           grep -rn "com.android.cast\|fourthline" --include=*.java --include=*.xml app/src/main || echo "无"
 
+      - name: 应用第三阶段补丁（网盘源下载 + 批量移动）
+        run: |
+          PATCH_B64=.github/patches/stage3.patch.gz.b64
+          if [ ! -f "$PATCH_B64" ]; then
+            echo "找不到 $PATCH_B64"
+            exit 1
+          fi
+          tr -d ' \t\n\r' < "$PATCH_B64" | base64 -d | gunzip > stage3.patch
+          echo "第三阶段补丁大小: $(wc -c < stage3.patch) 字节"
+          git apply --whitespace=nowarn -v stage3.patch \
+            || patch -p1 --no-backup-if-mismatch -i stage3.patch
+          rm -f stage3.patch
+          echo "新增文件检查："
+          ls -l app/src/main/java/com/github/tvbox/osc/download/LocalProxyResolver.java
+
       - name: 编译 Release APK
         run: |
           chmod +x gradlew
