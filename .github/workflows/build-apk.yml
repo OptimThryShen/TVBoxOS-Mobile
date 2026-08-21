@@ -730,20 +730,24 @@ jobs:
           echo "剩余失效库引用："
           grep -rn "com.android.cast\|fourthline" --include=*.java --include=*.xml app/src/main || echo "无"
 
-      - name: 应用第三阶段补丁（网盘源下载 + 批量移动）
+      - name: 应用增量补丁（.github/patches/*.b64，按文件名顺序）
         run: |
-          PATCH_B64=.github/patches/stage3.patch.gz.b64
-          if [ ! -f "$PATCH_B64" ]; then
-            echo "找不到 $PATCH_B64"
+          FOUND=0
+          for f in $(ls .github/patches/*.b64 2>/dev/null | sort); do
+            FOUND=1
+            echo "==> $f"
+            tr -d ' \t\n\r' < "$f" | base64 -d | gunzip > /tmp/inc.patch
+            echo "    补丁大小: $(wc -c < /tmp/inc.patch) 字节"
+            git apply --whitespace=nowarn -v /tmp/inc.patch \
+              || patch -p1 --no-backup-if-mismatch -i /tmp/inc.patch
+            rm -f /tmp/inc.patch
+          done
+          if [ "$FOUND" = "0" ]; then
+            echo "没有找到任何增量补丁"
             exit 1
           fi
-          tr -d ' \t\n\r' < "$PATCH_B64" | base64 -d | gunzip > stage3.patch
-          echo "第三阶段补丁大小: $(wc -c < stage3.patch) 字节"
-          git apply --whitespace=nowarn -v stage3.patch \
-            || patch -p1 --no-backup-if-mismatch -i stage3.patch
-          rm -f stage3.patch
-          echo "新增文件检查："
-          ls -l app/src/main/java/com/github/tvbox/osc/download/LocalProxyResolver.java
+          echo "download 包现在有："
+          ls app/src/main/java/com/github/tvbox/osc/download/
 
       - name: 编译 Release APK
         run: |
