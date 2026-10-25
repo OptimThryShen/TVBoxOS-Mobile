@@ -31,6 +31,7 @@ import com.orhanobut.hawk.Hawk;
 import org.greenrobot.eventbus.EventBus;
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -97,7 +98,7 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
         String uri = "";
         File file = new File(path);
         if(file.exists()){
-            uri = Uri.parse("file://"+file.getAbsolutePath()).toString();
+            uri = Uri.fromFile(file).toString();
         }
         mController.setTitle(videoInfo.getDisplayName());
         mVideoView.setUrl(uri); //设置视频地址
@@ -116,7 +117,14 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
             }
         });
 
-        PlayerHelper.updateCfg(mVideoView, mVodPlayerCfg);
+        JSONObject localPlayerCfg;
+        try {
+            localPlayerCfg = PlayerHelper.getLocalPlayerCfg(mVodPlayerCfg, path);
+        } catch (JSONException e) {
+            throw new IllegalStateException("Invalid local player configuration", e);
+        }
+        mController.setPlayerConfig(localPlayerCfg);
+        PlayerHelper.updateCfg(mVideoView, localPlayerCfg);
 
         if (fromSkip){
             mVideoView.replay(true);

@@ -21,6 +21,7 @@ import org.json.JSONObject;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Locale;
 
 import tv.danmaku.ijk.media.player.IjkLibLoader;
 import xyz.doikki.videoplayer.exo.ExoMediaPlayerFactory;
@@ -31,6 +32,19 @@ import xyz.doikki.videoplayer.render.RenderViewFactory;
 import xyz.doikki.videoplayer.render.TextureRenderViewFactory;
 
 public class PlayerHelper {
+    /**
+     * Use Exo's seekable progressive TS extractor for downloaded transport streams.
+     * Copy the configuration so a TS episode does not change the user's player choice
+     * for the next non-TS episode (or for online playback).
+     */
+    public static JSONObject getLocalPlayerCfg(JSONObject playerCfg, String path) throws JSONException {
+        JSONObject localCfg = new JSONObject(playerCfg.toString());
+        if (path != null && path.toLowerCase(Locale.ROOT).endsWith(".ts")) {
+            localCfg.put("pl", 2);
+        }
+        return localCfg;
+    }
+
     public static void updateCfg(VideoView videoView, JSONObject playerCfg) {
         int playerType = Hawk.get(HawkConfig.PLAY_TYPE, 0);
         int renderType = Hawk.get(HawkConfig.PLAY_RENDER, 0);

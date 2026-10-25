@@ -87,6 +87,9 @@ android {
 }
 
 dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    // Use a real JSONObject implementation in local JVM tests, not Android's stub.
+    testImplementation 'org.json:json:20231013'
     api fileTree(dir: "libs", include: ['*.jar', '*.aar'])
 
     implementation 'com.google.android.material:material:1.4.0'

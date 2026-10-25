@@ -113,7 +113,9 @@ public final class ExoMediaSourceHelper {
                 return new HlsMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(contentUri));
             default:
             case C.TYPE_OTHER:
-                return new ProgressiveMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(contentUri));
+                // Apply TS timestamp probing to normal files too, not just the HLS retry path.
+                return new ProgressiveMediaSource.Factory(factory, getExtractorsFactory())
+                        .createMediaSource(MediaItem.fromUri(contentUri));
         }
     }
 
@@ -125,7 +127,12 @@ public final class ExoMediaSourceHelper {
     }
 
     private static synchronized ExtractorsFactory getExtractorsFactory() {
-        return new DefaultExtractorsFactory().setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS).setTsExtractorTimestampSearchBytes(TsExtractor.DEFAULT_TIMESTAMP_SEARCH_BYTES * 3);
+        // Single-PMT mode reads the first/last PCR and provides a binary-search seek map
+        // for finite TS files. HLS segments must continue using HlsMediaSource instead.
+        return new DefaultExtractorsFactory()
+                .setTsExtractorMode(TsExtractor.MODE_SINGLE_PMT)
+                .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
+                .setTsExtractorTimestampSearchBytes(TsExtractor.DEFAULT_TIMESTAMP_SEARCH_BYTES * 3);
 
     }
 
