@@ -26,6 +26,9 @@ jobs:
 
       - name: 准备 Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 旧的 tools 包已下架，只安装仍提供的平台工具。
+          packages: platform-tools
 
       - name: 安装 SDK 组件
         run: sdkmanager "platform-tools" "platforms;android-33" "build-tools;32.0.0" "build-tools;33.0.2"
@@ -749,10 +752,10 @@ jobs:
           echo "download 包现在有："
           ls app/src/main/java/com/github/tvbox/osc/download/
 
-      - name: 编译 Release APK
+      - name: 测试并编译 Release APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew :app:testDebugUnitTest assembleRelease --no-daemon --stacktrace
 
       - name: 收集 APK
         id: collect
