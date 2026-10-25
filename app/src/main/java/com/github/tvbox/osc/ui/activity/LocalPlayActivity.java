@@ -22,6 +22,7 @@ import com.github.tvbox.osc.receiver.BatteryReceiver;
 import com.github.tvbox.osc.ui.dialog.AllLocalSeriesDialog;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.PlayerHelper;
+import com.github.tvbox.osc.util.TsTimestampNormalizer;
 import com.google.common.reflect.TypeToken;
 import com.lxj.xpopup.XPopup;
 import com.lxj.xpopup.core.BasePopupView;
@@ -38,6 +39,10 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import xyz.doikki.videoplayer.player.ProgressManager;
 import xyz.doikki.videoplayer.player.VideoView;
@@ -52,6 +57,10 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
     private int mPosition;
     BatteryReceiver mBatteryReceiver = new BatteryReceiver();
     private BasePopupView mAllSeriesRightDialog;
+    private final ExecutorService mPreparationExecutor = Executors.newSingleThreadExecutor();
+    private Future<?> mPreparation;
+    private int mPlayRequest;
+    private boolean mForeground = true;
     @Override
     protected void init() {
         registerReceiver(mBatteryReceiver,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
@@ -66,17 +75,6 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
         initPlayerCfg();
         mVideoView.setVideoController(mController); //设置控制器
         play(false);
-
-        new Handler()
-                .postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (mVideoView.getCurrentPlayState() == VideoView.STATE_PREPARED){//不知道为啥部分长视频(不确定是不是因为时长/大小)会卡在准备完成状态,所以延迟重置下状态
-                            mVideoView.pause();
-                            mVideoView.resume();
-                        }
-                    }
-                },500);
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
@@ -91,29 +89,55 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
      * 跳转到上/下一集,需重新播放
      */
     private void play(boolean fromSkip) {
-        VideoInfo videoInfo = mVideoList.get(mPosition);
-
-        String path = videoInfo.getPath();
-
-        String uri = "";
-        File file = new File(path);
-        if(file.exists()){
-            uri = Uri.fromFile(file).toString();
-        }
+        final VideoInfo videoInfo = mVideoList.get(mPosition);
+        final String path = videoInfo.getPath();
+        final File source = new File(path);
+        final int request = ++mPlayRequest;
+        if (mPreparation != null) mPreparation.cancel(true);
+        // Release the previous engine before changing factories (e.g. MP4/IJK -> TS/Exo).
+        mVideoView.release();
+        dismissLoadingDialog();
         mController.setTitle(videoInfo.getDisplayName());
-        mVideoView.setUrl(uri); //设置视频地址
+        if (!path.toLowerCase(Locale.ROOT).endsWith(".ts")) {
+            startPreparedFile(source, path, fromSkip);
+            return;
+        }
+        showLoadingDialog();
+        mPreparation = mPreparationExecutor.submit(() -> {
+            File prepared = source;
+            String error = null;
+            try {
+                prepared = TsTimestampNormalizer.prepare(source, new File(getExternalCacheDir(), "ts-timeline"));
+            } catch (Exception e) {
+                error = e.getMessage();
+            }
+            if (Thread.currentThread().isInterrupted()) return;
+            final File playable = prepared;
+            final String failure = error;
+            runOnUiThread(() -> {
+                if (request != mPlayRequest || isFinishing() || isDestroyed()) return;
+                dismissLoadingDialog();
+                if (failure != null) ToastUtils.showLong("TS 时间轴处理失败，尝试原文件播放：" + failure);
+                startPreparedFile(playable, path, fromSkip);
+            });
+        });
+    }
+
+    private void startPreparedFile(File file, String path, boolean fromSkip) {
+        mVideoView.setUrl(Uri.fromFile(file).toString());
 
         mVideoView.setProgressManager(new ProgressManager() {
             @Override
             public void saveProgress(String url, long progress) {// 就本地视频页面用sp,其余用Hawk
                 //有点本地文件确实总时长,设置下总时长,为什么用path,因为电影列表要通过媒体文件的path获取缓存的时长/进度,存取报纸缓存的key一直
-                SPUtils.getInstance(CacheConst.VIDEO_DURATION_SP).put(path, mVideoView.getDuration());
+                long duration = mVideoView.getDuration();
+                if (duration > 0) SPUtils.getInstance(CacheConst.VIDEO_DURATION_SP).put(path, duration);
                 SPUtils.getInstance(CacheConst.VIDEO_PROGRESS_SP).put(path, progress);
             }
 
             @Override
             public long getSavedProgress(String url) {
-                return SPUtils.getInstance(CacheConst.VIDEO_PROGRESS_SP).getLong(path);
+                return fromSkip ? 0 : Math.max(0, SPUtils.getInstance(CacheConst.VIDEO_PROGRESS_SP).getLong(path));
             }
         });
 
@@ -126,11 +150,15 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
         mController.setPlayerConfig(localPlayerCfg);
         PlayerHelper.updateCfg(mVideoView, localPlayerCfg);
 
-        if (fromSkip){
-            mVideoView.replay(true);
-        }else {
-            mVideoView.start(); //开始播放，不调用则不自动播放
-        }
+        mVideoView.start();
+        final int request = mPlayRequest;
+        new Handler().postDelayed(() -> {
+            if (request == mPlayRequest && mVideoView != null && mForeground
+                    && mVideoView.getCurrentPlayState() == VideoView.STATE_PREPARED) {
+                mVideoView.pause();
+                mVideoView.resume();
+            }
+        }, 500);
     }
 
     private void initController() {
@@ -197,7 +225,7 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
 
             @Override
             public void prepared() {
-
+                if (!mForeground && mVideoView != null) mVideoView.pause();
             }
 
             @Override
@@ -246,17 +274,23 @@ public class LocalPlayActivity extends BaseVbActivity<ActivityLocalPlayBinding> 
     @Override
     protected void onPause() {
         super.onPause();
+        mForeground = false;
         mVideoView.pause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        mForeground = true;
         mVideoView.resume();
     }
 
     @Override
     protected void onDestroy() {
+        mPlayRequest++;
+        if (mPreparation != null) mPreparation.cancel(true);
+        mPreparationExecutor.shutdownNow();
+        dismissLoadingDialog();
         super.onDestroy();
         unregisterReceiver(mBatteryReceiver);
         if (mVideoView != null) {

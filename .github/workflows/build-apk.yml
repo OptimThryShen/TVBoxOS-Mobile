@@ -733,13 +733,17 @@ jobs:
           echo "剩余失效库引用："
           grep -rn "com.android.cast\|fourthline" --include=*.java --include=*.xml app/src/main || echo "无"
 
-      - name: 应用增量补丁（.github/patches/*.b64，按文件名顺序）
+      - name: 应用增量补丁（.b64 / .patch，按文件名顺序）
         run: |
           FOUND=0
-          for f in $(ls .github/patches/*.b64 2>/dev/null | sort); do
+          for f in $(find .github/patches -maxdepth 1 -type f \( -name '*.b64' -o -name '*.patch' \) | sort); do
             FOUND=1
             echo "==> $f"
-            tr -d ' \t\n\r' < "$f" | base64 -d | gunzip > /tmp/inc.patch
+            if [[ "$f" == *.b64 ]]; then
+              tr -d ' \t\n\r' < "$f" | base64 -d | gunzip > /tmp/inc.patch
+            else
+              cp "$f" /tmp/inc.patch
+            fi
             echo "    补丁大小: $(wc -c < /tmp/inc.patch) 字节"
             git apply --whitespace=nowarn -v /tmp/inc.patch \
               || patch -p1 --no-backup-if-mismatch -i /tmp/inc.patch
@@ -751,6 +755,14 @@ jobs:
           fi
           echo "download 包现在有："
           ls app/src/main/java/com/github/tvbox/osc/download/
+
+      - name: 验证重置时间戳的 TS 分片合并
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          bash tests/verify-ts-timeline.sh
 
       - name: 测试并编译 Release APK
         run: |

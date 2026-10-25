@@ -1,0 +1,440 @@
+diff --git a/app/src/main/java/com/github/tvbox/osc/download/FileMover.java b/app/src/main/java/com/github/tvbox/osc/download/FileMover.java
+--- a/app/src/main/java/com/github/tvbox/osc/download/FileMover.java
++++ b/app/src/main/java/com/github/tvbox/osc/download/FileMover.java
+@@ -149,21 +149,20 @@
+         if (!targetDir.exists() && !targetDir.mkdirs()) throw new IOException("目标目录无法创建");
+         if (!targetDir.canWrite()) throw new IOException("目标目录没有写权限，换一个位置试试");
+ 
++        if (targetDir.getCanonicalFile().equals(source.getCanonicalFile().getParentFile())) return source;
+         File target = uniqueTarget(targetDir, source.getName());
+-        if (target.getAbsolutePath().equals(source.getAbsolutePath())) return source;
+-
+-        long free = targetDir.getUsableSpace();
+-        if (free > 0 && free < source.length()) {
+-            throw new IOException("目标位置剩余空间不足，需要 " + DownloadPaths.readableSize(source.length()));
+-        }
+-
+-        // 同卷直接改名
++
++        // 同卷直接改名，不需要再空出一份视频的空间。
+         if (source.renameTo(target)) {
+             MediaScanner.scan(context, target);
+             scanRemoved(context, source);
+             return target;
+         }
+ 
++        long free = targetDir.getUsableSpace();
++        if (free > 0 && free < source.length()) {
++            throw new IOException("目标位置剩余空间不足，需要 " + DownloadPaths.readableSize(source.length()));
++        }
+         FileInputStream in = null;
+         FileOutputStream out = null;
+         try {
+diff --git a/app/src/main/java/com/github/tvbox/osc/download/HlsDownloader.java b/app/src/main/java/com/github/tvbox/osc/download/HlsDownloader.java
+--- a/app/src/main/java/com/github/tvbox/osc/download/HlsDownloader.java
++++ b/app/src/main/java/com/github/tvbox/osc/download/HlsDownloader.java
+@@ -5,6 +5,7 @@
+ 
+ import com.github.tvbox.osc.util.HawkConfig;
+ import com.github.tvbox.osc.util.LOG;
++import com.github.tvbox.osc.util.TsTimestampNormalizer;
+ import com.orhanobut.hawk.Hawk;
+ 
+ import java.io.BufferedOutputStream;
+@@ -321,6 +322,21 @@
+             throw e;
+         }
+         closeQuietly(out);
++        if (!fragmentedMp4) {
++            File normalized = new File(output.getAbsolutePath() + ".timeline.tmp");
++            try {
++                TsTimestampNormalizer.normalize(output, normalized);
++                checkStopped();
++                if (!normalized.renameTo(output)) throw new IOException("无法保存修复后的 TS 时间轴");
++            } catch (java.io.InterruptedIOException e) {
++                throw e;
++            } catch (IOException e) {
++                // Unknown/corrupt transport format must never destroy a completed download.
++                LOG.e("MBoxDownload TS 时间轴处理失败，保留原文件：" + e);
++            } finally {
++                normalized.delete();
++            }
++        }
+         return output;
+     }
+ 
+diff --git a/app/src/main/java/com/github/tvbox/osc/download/TsMp4Remuxer.java b/app/src/main/java/com/github/tvbox/osc/download/TsMp4Remuxer.java
+--- a/app/src/main/java/com/github/tvbox/osc/download/TsMp4Remuxer.java
++++ b/app/src/main/java/com/github/tvbox/osc/download/TsMp4Remuxer.java
+@@ -4,33 +4,31 @@
+ import android.media.MediaExtractor;
+ import android.media.MediaFormat;
+ import android.media.MediaMuxer;
++import android.os.Build;
+ 
++import com.github.tvbox.osc.base.App;
++import com.github.tvbox.osc.util.AdtsSampleSplitter;
+ import com.github.tvbox.osc.util.HawkConfig;
+ import com.github.tvbox.osc.util.LOG;
++import com.github.tvbox.osc.util.TsTimestampNormalizer;
+ import com.orhanobut.hawk.Hawk;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.HashMap;
++import java.util.Locale;
+ import java.util.Map;
+ 
+-/**
+- * 把合并出来的 .ts 无损换成 .mp4（只换容器，不重新编码，所以很快也不掉画质）。
+- * 用系统的 MediaExtractor + MediaMuxer 完成。任何一步失败都保留原来的 .ts，
+- * .ts 本身就能播，所以这一步失败不影响观看。
+- */
++/** Lossless TS -> MP4. Repair the transport clock and unpack ADTS before feeding MediaMuxer. */
+ public class TsMp4Remuxer {
+-
+-    /** 单个采样的缓冲区上限，1080p 关键帧一般不超过 1MB，留大点更保险 */
+     private static final int BUFFER_SIZE = 8 * 1024 * 1024;
++    private static final int MAX_SAMPLE_SIZE = 64 * 1024 * 1024;
+ 
+     public static class Result {
+-        /** 最终文件，成功是 mp4，失败还是原来的 ts */
+         public final File file;
+         public final boolean converted;
+-        /** 没转成时的原因 */
+         public final String reason;
+-
+         Result(File file, boolean converted, String reason) {
+             this.file = file;
+             this.converted = converted;
+@@ -38,138 +36,154 @@
+         }
+     }
+ 
+-    private TsMp4Remuxer() {
+-    }
++    private TsMp4Remuxer() { }
+ 
+-    /** 下载完成后自动调用，受设置开关控制 */
+     public static File tryRemux(File tsFile) {
+         if (!Hawk.get(HawkConfig.DOWNLOAD_REMUX_MP4, true)) return tsFile;
+         return remux(tsFile).file;
+     }
+ 
+-    /** 手动触发的转换，忽略设置开关 */
+-    public static Result remux(File tsFile) {
+-        if (tsFile == null || !tsFile.exists()) {
+-            return new Result(tsFile, false, "文件不存在");
+-        }
+-        if (!tsFile.getName().toLowerCase().endsWith(".ts")) {
++    public static synchronized Result remux(File tsFile) {
++        if (tsFile == null || !tsFile.isFile()) return new Result(tsFile, false, "文件不存在");
++        if (!tsFile.getName().toLowerCase(Locale.ROOT).endsWith(".ts")) {
+             return new Result(tsFile, false, "不是 ts 文件，无需转换");
+         }
+-
+-        File mp4File = new File(tsFile.getAbsolutePath().replaceAll("\\.ts$", ".mp4"));
+-        if (mp4File.exists()) mp4File.delete();
+-
+         MediaExtractor extractor = null;
+         MediaMuxer muxer = null;
+-        boolean ok = false;
+-        String reason = null;
+-
++        File temp = null;
++        boolean started = false;
+         try {
++            File cacheDir = new File(App.getInstance().getExternalCacheDir(), "ts-timeline");
++            File input = TsTimestampNormalizer.prepare(tsFile, cacheDir);
+             extractor = new MediaExtractor();
+-            extractor.setDataSource(tsFile.getAbsolutePath());
+-
+-            int trackCount = extractor.getTrackCount();
+-            if (trackCount <= 0) {
+-                throw new IllegalStateException("这台设备的解封装器读不出 ts 的轨道");
++            extractor.setDataSource(input.getAbsolutePath());
++            String name = tsFile.getName();
++            File destination = FileMover.uniqueTarget(tsFile.getParentFile(), name.substring(0, name.length() - 3) + ".mp4");
++            temp = File.createTempFile("remux-", ".mp4.tmp", tsFile.getParentFile());
++            muxer = new MediaMuxer(temp.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
++            Map<Integer, Integer> tracks = new HashMap<>();
++            Map<Integer, String> mimes = new HashMap<>();
++            Map<Integer, Long> samples = new HashMap<>();
++            Map<Integer, Long> audioTimes = new HashMap<>();
++            boolean video = false;
++            for (int i = 0; i < extractor.getTrackCount(); i++) {
++                MediaFormat format = extractor.getTrackFormat(i);
++                String mime = format.getString(MediaFormat.KEY_MIME);
++                if (mime == null || (!mime.startsWith("video/") && !mime.startsWith("audio/"))) continue;
++                // ADTS transport headers are removed below, so advertise raw AAC to the MP4 writer.
++                if ("audio/mp4a-latm".equals(mime)) format.setInteger(MediaFormat.KEY_IS_ADTS, 0);
++                int out;
++                try {
++                    out = muxer.addTrack(format);
++                } catch (Exception e) {
++                    throw new IOException("MP4 不支持 " + mime + " 轨道，已保留原 TS", e);
++                }
++                tracks.put(i, out);
++                mimes.put(i, mime);
++                samples.put(out, 0L);
++                extractor.selectTrack(i);
++                video |= mime.startsWith("video/");
+             }
+-
+-            muxer = new MediaMuxer(mp4File.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+-            Map<Integer, Integer> trackMap = new HashMap<>();
+-            boolean hasVideo = false;
+-            String addTrackError = null;
+-
+-            for (int i = 0; i < trackCount; i++) {
+-                MediaFormat format;
+-                String mime;
+-                try {
+-                    format = extractor.getTrackFormat(i);
+-                    mime = format.getString(MediaFormat.KEY_MIME);
+-                } catch (Throwable e) {
+-                    continue;
+-                }
+-                if (mime == null) continue;
+-                boolean video = mime.startsWith("video/");
+-                if (!video && !mime.startsWith("audio/")) continue;
+-                try {
+-                    trackMap.put(i, muxer.addTrack(format));
+-                    extractor.selectTrack(i);
+-                    if (video) hasVideo = true;
+-                } catch (Throwable e) {
+-                    // 某条音轨（比如 AC3/DTS）mp4 装不下就跳过它，视频还是能转
+-                    addTrackError = mime + " 轨道不被 mp4 支持";
+-                    LOG.e("MBoxDownload 跳过轨道 " + mime + "：" + e);
+-                }
+-            }
+-
+-            if (!hasVideo || trackMap.isEmpty()) {
+-                throw new IllegalStateException(addTrackError != null ? addTrackError : "没有可用的音视频轨道");
+-            }
+-
++            if (!video) throw new IOException("系统解封装器未读到视频轨道，已保留原 TS");
+             muxer.start();
+-            ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+-            long samples = 0;
+-            while (true) {
+-                int sampleTrack = extractor.getSampleTrackIndex();
+-                if (sampleTrack < 0) break;
+-                Integer outTrack = trackMap.get(sampleTrack);
+-                if (outTrack == null) {
+-                    extractor.advance();
+-                    continue;
++            started = true;
++            ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
++            long origin = Math.max(0, extractor.getSampleTime());
++            while (extractor.getSampleTrackIndex() >= 0) {
++                if (Thread.currentThread().isInterrupted()) throw new IOException("转换已取消");
++                int track = extractor.getSampleTrackIndex();
++                int flags = extractor.getSampleFlags();
++                if ((flags & MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0) throw new IOException("加密采样不能直接转为 MP4");
++                if ((flags & MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) throw new IOException("系统返回不完整采样，已保留原 TS");
++                if (Build.VERSION.SDK_INT >= 28) {
++                    long size = extractor.getSampleSize();
++                    if (size > MAX_SAMPLE_SIZE) throw new IOException("单帧超过 64 MB，已保留原 TS");
++                    if (size > buffer.capacity()) buffer = ByteBuffer.allocateDirect((int) size);
+                 }
+                 buffer.clear();
+                 int size = extractor.readSampleData(buffer, 0);
+                 if (size < 0) break;
+-                long time = extractor.getSampleTime();
+-                if (time < 0) time = 0;
+-
+-                info.offset = 0;
+-                info.size = size;
+-                info.presentationTimeUs = time;
+-                info.flags = extractor.getSampleFlags();
+-                buffer.position(0);
+-                buffer.limit(size);
+-                muxer.writeSampleData(outTrack, buffer, info);
+-                samples++;
++                long time = Math.max(0, extractor.getSampleTime() - origin);
++                Integer out = tracks.get(track);
++                if (out != null && size > 0) {
++                    final ByteBuffer data = buffer;
++                    final MediaMuxer writer = muxer;
++                    final int outputTrack = out;
++                    // MediaExtractor flags and MediaCodec flags are different enums. Never pass them verbatim.
++                    final int outputFlags = (flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
++                            ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
++                    AdtsSampleSplitter.Consumer write = (offset, length, timestamp) -> {
++                        if (mimes.get(track).startsWith("audio/")) {
++                            Long previous = audioTimes.get(outputTrack);
++                            // Independently encoded HLS segments may overlap by AAC encoder priming.
++                            // Drop duplicate/overlapping audio frames, never accumulate drift by clamping every PTS.
++                            if (previous != null && timestamp <= previous) {
++                                if (previous - timestamp > 100000) throw new IOException("音频时间戳仍有跳变，已保留原 TS");
++                                return;
++                            }
++                            audioTimes.put(outputTrack, timestamp);
++                        }
++                        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
++                        info.set(offset, length, timestamp, outputFlags);
++                        data.position(0);
++                        data.limit(size);
++                        try {
++                            writer.writeSampleData(outputTrack, data, info);
++                        } catch (Exception e) {
++                            throw new IOException("写入 MP4 采样失败（" + mimes.get(track) + ", " + timestamp + " us）：" + e.getMessage(), e);
++                        }
++                        samples.put(outputTrack, samples.get(outputTrack) + 1);
++                    };
++                    if (!"audio/mp4a-latm".equals(mimes.get(track))
++                            || !AdtsSampleSplitter.split(buffer, size, time, write)) {
++                        write.sample(0, size, time);
++                    }
++                }
+                 extractor.advance();
+             }
+-            if (samples == 0) throw new IllegalStateException("没有读到任何数据帧");
+-            ok = true;
+-        } catch (Throwable e) {
+-            reason = e.getMessage() == null ? e.toString() : e.getMessage();
+-            LOG.e("MBoxDownload 转封装 mp4 失败，保留 ts：" + e);
++            muxer.stop();
++            started = false;
++            muxer.release();
++            muxer = null;
++            extractor.release();
++            extractor = null;
++            verifySamples(temp, samples);
++            // No percentage-of-input-size heuristic: TS padding/ADTS overhead can be arbitrarily large.
++            if (destination.exists() || !temp.renameTo(destination)) throw new IOException("无法保存 MP4（目标已存在或目录不可写）");
++            if (!tsFile.delete()) LOG.e("MBoxDownload MP4 已完成，原 TS 未能删除：" + tsFile);
++            if (!input.equals(tsFile)) input.delete();
++            return new Result(destination, true, null);
++        } catch (Exception e) {
++            LOG.e("MBoxDownload 转封装失败，保留 TS：" + e);
++            return new Result(tsFile, false, e.getMessage() == null ? e.toString() : e.getMessage());
+         } finally {
+             if (muxer != null) {
+-                try {
+-                    if (ok) muxer.stop();
+-                } catch (Throwable e) {
+-                    ok = false;
+-                    reason = "写出 mp4 收尾失败：" + e;
+-                    LOG.e("MBoxDownload muxer.stop 失败：" + e);
+-                }
+-                try {
+-                    muxer.release();
+-                } catch (Throwable ignored) {
+-                }
++                if (started) { try { muxer.stop(); } catch (Exception ignored) { } }
++                try { muxer.release(); } catch (Exception ignored) { }
+             }
+-            if (extractor != null) {
+-                try {
+-                    extractor.release();
+-                } catch (Throwable ignored) {
+-                }
++            if (extractor != null) { try { extractor.release(); } catch (Exception ignored) { } }
++            if (temp != null) temp.delete();
++        }
++    }
++
++    /** A completed muxer is not sufficient: check every written sample before deleting the source. */
++    private static void verifySamples(File file, Map<Integer, Long> expected) throws IOException {
++        MediaExtractor check = new MediaExtractor();
++        try {
++            check.setDataSource(file.getAbsolutePath());
++            if (check.getTrackCount() != expected.size()) throw new IOException("MP4 轨道数不一致，已保留原 TS");
++            long[] actual = new long[check.getTrackCount()];
++            for (int i = 0; i < actual.length; i++) check.selectTrack(i);
++            while (check.getSampleTrackIndex() >= 0) {
++                if (Thread.currentThread().isInterrupted()) throw new IOException("转换校验已取消");
++                actual[check.getSampleTrackIndex()]++;
++                check.advance();
+             }
++            for (int i = 0; i < actual.length; i++) {
++                if (actual[i] == 0 || actual[i] != expected.get(i)) throw new IOException("MP4 采样数校验失败，已保留原 TS");
++            }
++        } finally {
++            check.release();
+         }
+-
+-        // ts 每 188 字节带 4 字节包头，转成 mp4 通常小 3%~5%，明显更小说明丢内容了
+-        if (ok && mp4File.exists() && mp4File.length() > tsFile.length() * 0.8) {
+-            tsFile.delete();
+-            return new Result(mp4File, true, null);
+-        }
+-        if (ok && mp4File.exists()) {
+-            reason = "转换结果只有原文件的 "
+-                    + (tsFile.length() == 0 ? 0 : mp4File.length() * 100 / tsFile.length()) + "%，判定为丢内容";
+-        }
+-        if (mp4File.exists()) mp4File.delete();
+-        return new Result(tsFile, false, reason == null ? "未知原因" : reason);
+     }
+ }
+diff --git a/app/src/main/java/com/github/tvbox/osc/ui/activity/DownloadManagerActivity.java b/app/src/main/java/com/github/tvbox/osc/ui/activity/DownloadManagerActivity.java
+--- a/app/src/main/java/com/github/tvbox/osc/ui/activity/DownloadManagerActivity.java
++++ b/app/src/main/java/com/github/tvbox/osc/ui/activity/DownloadManagerActivity.java
+@@ -30,6 +30,9 @@
+ import com.github.tvbox.osc.util.Utils;
+ import com.github.tvbox.osc.util.HawkConfig;
+ import com.hjq.bar.TitleBar;
++import com.hjq.permissions.OnPermissionCallback;
++import com.hjq.permissions.Permission;
++import com.hjq.permissions.XXPermissions;
+ import com.lxj.xpopup.XPopup;
+ import com.orhanobut.hawk.Hawk;
+ 
+@@ -270,11 +273,41 @@
+         Hawk.put(HawkConfig.DOWNLOAD_REMUX_MP4, now);
+         ToastUtils.showLong(now
+                 ? "下载完成后会尝试转成 MP4（不重编码，画质不变）"
+-                : "下载完成后保留 ts，省一次全量读写；ts 也能播，只是拖进度条不准");
++                : "下载完成后保留 TS，合并时会修复时间轴；已有文件首次播放会自动检查");
++    }
++
++    /** The download directory is app-private; moving outside it needs a separate runtime grant. */
++    private void withStorageAccess(Runnable action) {
++        if (XXPermissions.isGranted(this, Permission.MANAGE_EXTERNAL_STORAGE)) {
++            action.run();
++            return;
++        }
++        new XPopup.Builder(this)
++                .isDarkTheme(Utils.isDarkTheme())
++                .asConfirm("移动文件需要授权", "要移动到手机存储中的自建目录，请在系统设置中允许“所有文件访问权限”。未授权不会移动或删除原文件。", () ->
++                        XXPermissions.with(this)
++                                .permission(Permission.MANAGE_EXTERNAL_STORAGE)
++                                .request(new OnPermissionCallback() {
++                                    @Override
++                                    public void onGranted(List<String> permissions, boolean all) {
++                                        if (all && !isFinishing() && !isDestroyed()) action.run();
++                                    }
++
++                                    @Override
++                                    public void onDenied(List<String> permissions, boolean never) {
++                                        ToastUtils.showLong("未获得文件读写权限，原文件未移动。可在系统应用设置中授权后重试。");
++                                        if (never) XXPermissions.startPermissionActivity(DownloadManagerActivity.this, permissions);
++                                    }
++                                }))
++                .show();
+     }
+ 
+     /** 批量移动到别的目录，比如整季挪到 SD 卡 */
+     private void batchMove() {
++        withStorageAccess(this::chooseBatchMove);
++    }
++
++    private void chooseBatchMove() {
+         List<DownloadTask> selected = adapter.getSelectedTasks();
+         if (selected.isEmpty()) {
+             ToastUtils.showShort("还没有选中任何一条");
+@@ -487,6 +520,10 @@
+     }
+ 
+     private void moveFile(final DownloadTask task) {
++        withStorageAccess(() -> chooseMoveFile(task));
++    }
++
++    private void chooseMoveFile(final DownloadTask task) {
+         final File file = fileOf(task);
+         if (file == null) return;
+         new XPopup.Builder(this)

@@ -1,0 +1,2 @@
+# Unified diff context lines require a leading space, even for empty source lines.
+.github/patches/*.patch whitespace=-blank-at-eol
